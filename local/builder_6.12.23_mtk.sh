@@ -457,6 +457,7 @@ make -j$(nproc --all) \
 echo ">>> 内核编译成功！"
 
 # ===== 选择使用 patch_linux (KPM补丁)=====
+WORKDIR="$SCRIPT_DIR"
 OUT_DIR="$WORKDIR/kernel_workspace/common/out/arch/arm64/boot"
 if [[ "$USE_PATCH_LINUX" == [bB] && $KSU_BRANCH == [yYrR] ]]; then
   echo ">>> 使用 patch_linux 工具处理输出..."
