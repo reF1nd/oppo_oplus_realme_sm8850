@@ -27,6 +27,11 @@ on:
         required: true
         type: boolean
         default: 'true'
+      hymofs_enable:
+        description: '是否启用HymoFS支持(高性能混合覆盖文件系统)'
+        required: true
+        type: boolean
+        default: 'false'
       kpm_enable:
         description: '是否开启kpm(builtin-使用(re)sukisu内置kpm, kpn-使用独立kpm实现(支持任意KSU/面具环境); 不需要可保持默认关闭)'
         required: true
@@ -355,7 +360,14 @@ jobs:
             cd ./KernelSU
             patch -p1 < 10_enable_susfs_for_ksu.patch || true
           fi
-          
+
+      - name: 启用HymoFS支持
+        if: inputs.hymofs_enable
+        run: |
+          echo "正在启用HymoFS支持…"
+          cd kernel_workspace/common
+          curl -LSs https://raw.githubusercontent.com/Anatdx/HymoFS/main/setup.sh | bash -s defconfig arch/arm64/configs/gki_defconfig
+
       - name: 应用lz4 1.10.0 & zstd 1.5.7补丁
         if: inputs.lz4_enable
         run: |
@@ -375,7 +387,7 @@ jobs:
           cd kernel_workspace/common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/lz4kd.patch
           patch -p1 -F 3 < lz4kd.patch || true
-          
+
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
         run: |
@@ -395,7 +407,7 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          
+
       - name: 添加 KSU & 其他配置项
         run: |
           cd kernel_workspace
@@ -765,6 +777,7 @@ jobs:
           echo "KSU Branch: ${KSU_TYPENAME}" >> ./ak3.log
           echo "KSU Ver: ${KSUVER}" >> ./ak3.log
           echo "susfs: ${{ github.event.inputs.susfs_enable }}" >> ./ak3.log
+          echo "HymoFS: ${{ github.event.inputs.hymofs_enable }}" >> ./ak3.log
           echo "KPM: ${{ github.event.inputs.kpm_enable }}" >> ./ak3.log
           echo "LZ4: ${{ github.event.inputs.lz4_enable }}" >> ./ak3.log
           echo "LZ4KD: ${{ github.event.inputs.lz4kd_enable }}" >> ./ak3.log
@@ -849,6 +862,7 @@ jobs:
             - 机型：欧加真骁龙8E Gen5通用 ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核（基于 AOSP 官方 android16-6.12-2025-06 源码分支）
             - KSU分支：${{ env.KSU_TYPENAME }}
             - susfs支持：${{ github.event.inputs.susfs_enable }}
+            - HymoFS支持：${{ github.event.inputs.hymofs_enable }}
             - KPM支持 ：${{ github.event.inputs.kpm_enable }}
             - LZ4支持：${{ github.event.inputs.lz4_enable }}
             - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
