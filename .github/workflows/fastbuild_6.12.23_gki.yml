@@ -95,6 +95,11 @@ on:
         required: false
         type: string
         default: ''
+      ebpf_enable:
+        description: '是否构建 Scene Hider eBPF 模块(隐藏Scene运行时端口;需要内核支持eBPF/BTF/cgroup socket hook，将与内核一同上传至Release)'
+        required: true
+        type: boolean
+        default: 'false'
 
 jobs:
   build:
@@ -258,7 +263,7 @@ jobs:
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "resukisu" ]]; then
             echo "正在配置ReSukiSU（由于SukiSU长期未维护无法正常编译，且ReSukiSU兼容sukisu管理器，故SukiSU源码仓库已重定向为resukisu）..."
             curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s main
-            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@reF1nd"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
@@ -774,6 +779,7 @@ jobs:
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
+          echo "Scene Hider eBPF: ${{ github.event.inputs.ebpf_enable }}" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
       - name: 上传 Ccache 调试日志
@@ -789,8 +795,98 @@ jobs:
           path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
           archive: false
 
-  release:
+      - name: 提取 vmlinux BTF 供 eBPF 编译使用
+        if: inputs.ebpf_enable
+        run: |
+          echo "正在从编译产物中提取 vmlinux BTF 数据..."
+          LLVM_OBJCOPY="${{ github.workspace }}/kernel_workspace/clang19/bin/llvm-objcopy"
+          VMLINUX="${{ github.workspace }}/kernel_workspace/common/out/vmlinux"
+          BTF_OUT="${{ github.workspace }}/kernel_workspace/vmlinux.btf"
+          if [[ ! -f "$VMLINUX" ]]; then
+            echo "错误：未找到 vmlinux 文件：$VMLINUX"
+            exit 1
+          fi
+          "$LLVM_OBJCOPY" --only-section=.BTF -O binary "$VMLINUX" "$BTF_OUT"
+          # 校验 BTF magic (9feb0100)
+          MAGIC=$(xxd -p -l 4 "$BTF_OUT")
+          if [[ "$MAGIC" != "9feb0100" ]]; then
+            echo "错误：BTF magic 校验失败：$MAGIC（期望 9feb0100）"
+            exit 1
+          fi
+          echo "BTF 提取成功，文件大小：$(du -sh "$BTF_OUT" | cut -f1)"
+
+      - name: 上传 vmlinux BTF 工件
+        if: inputs.ebpf_enable
+        uses: actions/upload-artifact@v7
+        with:
+          name: vmlinux-gki-${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}
+          path: ${{ github.workspace }}/kernel_workspace/vmlinux.btf
+
+  build_ebpf:
     needs: build
+    if: github.event.inputs.ebpf_enable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载 vmlinux BTF 工件
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'vmlinux-*'
+          path: downloaded_vmlinux
+
+      - name: 克隆 Scene-Port-Hider
+        run: git clone https://github.com/Andrea-lyz/Scene-Port-Hider-by-eBPF.git ebpf_project
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt update
+          sudo apt install -y curl unzip make git clang llvm lld tar xxd zip pkg-config autoconf automake libtool bzip2 xz-utils
+
+      - name: 安装 bpftool
+        run: |
+          BPFTOOL_VERSION="v7.7.0"
+          curl -fL --retry 3 \
+            "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz" \
+            -o "$RUNNER_TEMP/bpftool.tar.gz"
+          mkdir -p "$RUNNER_TEMP/bpftool"
+          tar -xzf "$RUNNER_TEMP/bpftool.tar.gz" -C "$RUNNER_TEMP/bpftool"
+          BPFTOOL_PATH="$(find "$RUNNER_TEMP/bpftool" -type f -name bpftool | head -n 1)"
+          chmod +x "$BPFTOOL_PATH"
+          echo "BPFTOOL=$BPFTOOL_PATH" >> "$GITHUB_ENV"
+          "$BPFTOOL_PATH" version
+
+      - name: 准备 BTF 文件
+        run: |
+          BTF_FILE=$(find downloaded_vmlinux -name "vmlinux.btf" -type f | head -n 1)
+          if [[ -z "$BTF_FILE" ]]; then
+            echo "错误：未在下载目录中找到 vmlinux.btf！"
+            exit 1
+          fi
+          echo "找到 BTF 文件：$BTF_FILE"
+          mkdir -p ebpf_project/btf
+          cp "$BTF_FILE" ebpf_project/btf/vmlinux.btf
+          echo "BTF 文件大小：$(du -sh ebpf_project/btf/vmlinux.btf | cut -f1)"
+
+      - name: 缓存 Android arm64 依赖
+        uses: actions/cache@v5
+        with:
+          path: ~/hideport-deps
+          key: hideport-deps-r25c-${{ runner.os }}-${{ hashFiles('ebpf_project/build_deps_android.sh') }}
+
+      - name: 构建 Scene Hider eBPF 模块
+        working-directory: ebpf_project
+        run: |
+          export DEPS_DIR="$HOME/hideport-deps"
+          bash tools/build_from_btf.sh
+
+      - name: 上传 eBPF 模块工件
+        uses: actions/upload-artifact@v7
+        with:
+          name: ScenePortHider-eBPF
+          path: hideSceneport_module.zip
+
+  release:
+    needs: [build, build_ebpf]
+    if: always() && needs.build.result == 'success' && (needs.build_ebpf.result == 'success' || needs.build_ebpf.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -804,6 +900,13 @@ jobs:
           name: ${{ needs.build.outputs.ak3name }}
           path: ./release_zips
           skip-decompress: true
+
+      - name: 下载 Scene Hider eBPF 模块工件
+        if: github.event.inputs.ebpf_enable == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: ScenePortHider-eBPF
+          path: ./release_zips
 
       - name: 设置环境变量
         run: |
@@ -858,6 +961,7 @@ jobs:
           - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
           - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
+          - Scene Hider eBPF模块支持：${{ github.event.inputs.ebpf_enable }}
           - ReSukiSU管理器下载：[ReSukiSU_CI](https://github.com/cctv18/ReSukiSU_CI/releases)
           - SukiSU Ultra管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
           - KernelSU Next管理器下载：[KernelSU-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)
@@ -878,8 +982,12 @@ jobs:
           #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用[KernelFlasher](https://github.com/capntrips/KernelFlasher)等软件备份boot等关键启动分区!※※※
           EOF
 
+          RELEASE_FILES=(release_zips/AnyKernel3_*.zip)
+          if [[ "${{ github.event.inputs.ebpf_enable }}" == "true" && -f "release_zips/hideSceneport_module.zip" ]]; then
+            RELEASE_FILES+=("release_zips/hideSceneport_module.zip")
+          fi
           gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
             --repo "${{ github.repository }}" \
             --title "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}" \
             --notes-file release_notes.md \
-            release_zips/AnyKernel3_*.zip
+            "${RELEASE_FILES[@]}"
