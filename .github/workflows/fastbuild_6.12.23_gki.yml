@@ -339,6 +339,13 @@ jobs:
           cd kernel_workspace/common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/lz4kd.patch
           patch -p1 -F 3 < lz4kd.patch || true
+
+      - name: 应用 Unicode Bypass 修复补丁
+        run: |
+          echo "正在应用 Unicode bypass fix 补丁…"
+          cd kernel_workspace/common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/unicode_bypass_fix.patch
+          patch -p1 -F 3 < unicode_bypass_fix.patch || true
           
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
