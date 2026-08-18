@@ -3,6 +3,7 @@ set -e
 
 # ===== 获取脚本目录 =====
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 # ===== 设置自定义参数 =====
@@ -15,7 +16,7 @@ read -p "是否启用susfs？(y/n，默认：y): " APPLY_SUSFS
 APPLY_SUSFS=${APPLY_SUSFS:-y}
 read -p "是否启用 KPM？(y-启用 KpatchNext独立kpm实现, n-关闭kpm，默认：n): " USE_PATCH_LINUX
 USE_PATCH_LINUX=${USE_PATCH_LINUX:-n}
-read -p "KSU分支版本(r=ReSukiSU, y=SukiSU Ultra, n=KernelSU Next, k=KSU, l=lkm模式(无内置KSU), 默认：r): " KSU_BRANCH
+read -p "KSU分支版本(r=ReSukiSU, y=SukiSU Ultra, w=KOWSU, n=KernelSU Next, k=KSU, l=lkm模式(无内置KSU), 默认：r): " KSU_BRANCH
 KSU_BRANCH=${KSU_BRANCH:-r}
 read -p "是否应用 lz4 1.10.0 & zstd 1.5.7 补丁？(y/n，默认：y): " APPLY_LZ4
 APPLY_LZ4=${APPLY_LZ4:-y}
@@ -42,6 +43,8 @@ elif [[ "$KSU_BRANCH" == "n" || "$KSU_BRANCH" == "N" ]]; then
   KSU_TYPE="KernelSU Next"
 elif [[ "$KSU_BRANCH" == "k" || "$KSU_BRANCH" == "K" ]]; then
   KSU_TYPE="KernelSU"
+elif [[ "$KSU_BRANCH" == "w" || "$KSU_BRANCH" == "W" ]]; then
+  KSU_TYPE="KOWSU"
 else
   KSU_TYPE="no KSU"
 fi
@@ -91,10 +94,10 @@ mkdir kernel_workspace
 cd kernel_workspace
 
 echo "正在克隆源码仓库..."
-aria2c -s16 -x16 -k1M https://github.com/cctv18/android_gki_kernel_common/archive/refs/heads/android16-6.12-2025-06.zip -o common.zip &&
-unzip -q common.zip &&
-mv "android_gki_kernel_common-android16-6.12-2025-06" common &&
-rm -rf common.zip &
+curl -fsSL --retry 3 https://android.googlesource.com/kernel/common/+archive/refs/tags/android16-6.12-2025-06_r58.tar.gz -o common.tar.gz &&
+mkdir common &&
+tar -xzf common.tar.gz -C common &&
+rm -f common.tar.gz &
 
 echo "正在克隆llvm-clang19工具链..." &&
 mkdir -p clang19 &&
@@ -147,7 +150,7 @@ elif [[ "$KSU_BRANCH" == "n" || "$KSU_BRANCH" == "N" ]]; then
   sed -i "s/KSU_VERSION_TAG_FALLBACK := v0.0.1/KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG/g" kernel/Kbuild
   #为KernelSU Next添加WildKSU管理器支持
   cd ../common/drivers/kernelsu
-  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/other_patch/apk_sign.patch
+  cp "$REPO_ROOT/other_patch/apk_sign.patch" ./apk_sign.patch
   patch -p2 -N -F 3 < apk_sign.patch || true
 elif [[ "$KSU_BRANCH" == "k" || "$KSU_BRANCH" == "K" ]]; then
   echo "正在配置原版 KernelSU (tiann/KernelSU)..."
@@ -155,6 +158,19 @@ elif [[ "$KSU_BRANCH" == "k" || "$KSU_BRANCH" == "K" ]]; then
   cd ./KernelSU
   KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
   sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
+elif [[ "$KSU_BRANCH" == "w" || "$KSU_BRANCH" == "W" ]]; then
+  echo "正在配置 KOWSU (KOWX712/KernelSU)..."
+  git clone --branch master https://github.com/KOWX712/KernelSU.git KernelSU
+  patch -p1 -d ./KernelSU --forward < "$REPO_ROOT/.github/patches/24_extra_features_for_ksu.patch"
+  KSU_VERSION=$(expr $(git -C KernelSU rev-list --count HEAD) + 30000 2>/dev/null || echo 30000)
+  sed -i "s|^ccflags-y += -DKSU_VERSION=.*|ccflags-y += -DKSU_VERSION=${KSU_VERSION}|" KernelSU/kernel/Kbuild 2>/dev/null || true
+  sed -i "s|^CFLAGS_ksu\.o += -DKSU_VERSION=.*|CFLAGS_ksu.o += -DKSU_VERSION=${KSU_VERSION}|" KernelSU/kernel/Makefile 2>/dev/null || true
+  cd ./common
+  rm -rf drivers/kernelsu
+  ln -s ../../KernelSU/kernel drivers/kernelsu
+  test -r drivers/kernelsu/Kconfig
+  grep -q "kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+  grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 else
   echo "已选择无内置KernelSU模式，跳过配置..."
 fi
@@ -164,29 +180,45 @@ cd "$WORKDIR/kernel_workspace"
 echo ">>> 应用 SUSFS&hook 补丁..."
 if [[ "$APPLY_SUSFS" == [yY] ]]; then
   echo ">>> 克隆补丁仓库..."
-  git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android16-6.12
-  cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./common/
+  git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu -b gki-android16-6.12
   cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
   cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
   cd ./common
-  patch -p1 < 50_add_susfs_in_gki-android16-6.12.patch || true
+  patch -p1 < "$REPO_ROOT/.github/patches/android16-6.12/50_add_susfs_in_gki-android16-6.12.23.patch"
 else
   echo ">>> 未开启susfs，跳过susfs补丁配置..."
 fi
 cd "$WORKDIR/kernel_workspace"
-if [[ "$KSU_BRANCH" == [kK] && "$APPLY_SUSFS" == [yY] ]]; then
+if [[ "$KSU_BRANCH" == [wW] && "$APPLY_SUSFS" == [yY] ]]; then
+  patch -p1 -d ./KernelSU --forward < "$REPO_ROOT/.github/patches/10_enable_susfs_for_ksu.patch"
+elif [[ "$KSU_BRANCH" == [kK] && "$APPLY_SUSFS" == [yY] ]]; then
   cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
   cd ./KernelSU
   patch -p1 < 10_enable_susfs_for_ksu.patch || true
+fi
+if [[ "$KSU_BRANCH" == [wW] ]]; then
+  awk '
+    BEGIN { found = 0 }
+    /KSU_KERNEL_DIR := \$\(realpath \$\(dir \$\(lastword \$\(MAKEFILE_LIST\)\)\)\)/ { found = 1 }
+    { print }
+    END {
+      if (!found) {
+        print ""
+        print "# Resolve the real KOWSU source directory when included through drivers/kernelsu."
+        print "KSU_KERNEL_DIR := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))"
+        print "ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include"
+      }
+    }
+  ' KernelSU/kernel/Kbuild > KernelSU/kernel/Kbuild.tmp
+  mv KernelSU/kernel/Kbuild.tmp KernelSU/kernel/Kbuild
 fi
 cd "$WORKDIR/kernel_workspace"
 
 # ===== 应用 LZ4 & ZSTD 补丁 =====
 if [[ "$APPLY_LZ4" == "y" || "$APPLY_LZ4" == "Y" ]]; then
   echo ">>> 正在添加lz4 1.10.0 & zstd 1.5.7补丁..."
-  git clone --depth=1 https://github.com/cctv18/oppo_oplus_realme_sm8850.git
-  cp ./oppo_oplus_realme_sm8850/zram_patch/001-lz4.patch ./common/
-  cp ./oppo_oplus_realme_sm8850/zram_patch/002-zstd.patch ./common/
+  cp "$REPO_ROOT/zram_patch/001-lz4.patch" ./common/
+  cp "$REPO_ROOT/zram_patch/002-zstd.patch" ./common/
   cd "$WORKDIR/kernel_workspace/common"
   patch -p1 -F 3 < 001-lz4.patch || true
   patch -p1 -F 3 < 002-zstd.patch || true
@@ -200,7 +232,7 @@ fi
 if [[ "$APPLY_LZ4KD" == "y" || "$APPLY_LZ4KD" == "Y" ]]; then
   echo ">>> 应用 LZ4KD 补丁..."
   cd "$WORKDIR/kernel_workspace/common"
-  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/other_patch/lz4kd.patch
+  cp "$REPO_ROOT/other_patch/lz4kd.patch" ./lz4kd.patch
   patch -p1 -F 3 < lz4kd.patch || true
   cd "$WORKDIR/kernel_workspace"
 else
@@ -244,7 +276,7 @@ echo "CONFIG_HEADERS_INSTALL=n" >> "$DEFCONFIG_FILE"
 
 # 应用 CVE_2026_43499 修复补丁
 cd common
-wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/other_patch/cve-2026-43499-rtmutex-6.12.patch
+cp "$REPO_ROOT/other_patch/cve-2026-43499-rtmutex-6.12.patch" ./cve-2026-43499-rtmutex-6.12.patch
 patch -p1 -F 3 < cve-2026-43499-rtmutex-6.12.patch
 cd ..
 
@@ -295,7 +327,7 @@ if [[ "$APPLY_BETTERNET" == "y" || "$APPLY_BETTERNET" == "Y" ]]; then
   echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> "$DEFCONFIG_FILE"
   #由于部分机型的vintf兼容性检测规则，在开启CONFIG_IP6_NF_NAT后开机会出现"您的设备内部出现了问题。请联系您的设备制造商了解详情。"的提示，故添加一个配置修复补丁，在编译内核时隐藏CONFIG_IP6_NF_NAT=y但不影响对应功能编译
   cd common
-  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/other_patch/config.patch
+  cp "$REPO_ROOT/other_patch/config.patch" ./config.patch
   patch -p1 -F 3 < config.patch || true
   cd ..
 fi
@@ -312,9 +344,9 @@ if [[ "$APPLY_BBR" == "y" || "$APPLY_BBR" == "Y" || "$APPLY_BBR" == "d" || "$APP
   echo "CONFIG_TCP_CONG_HTCP=y" >> "$DEFCONFIG_FILE"
   echo "CONFIG_TCP_CONG_BRUTAL=y" >> "$DEFCONFIG_FILE"
   if [[ "$APPLY_BBR" == "d" || "$APPLY_BBR" == "D" ]]; then
-    echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> "$DEFCONFIG_FILE"
+    echo "CONFIG_DEFAULT_BBR=y" >> "$DEFCONFIG_FILE"
   else
-    echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> "$DEFCONFIG_FILE"
+    echo "CONFIG_DEFAULT_CUBIC=y" >> "$DEFCONFIG_FILE"
   fi
 fi
 
@@ -336,13 +368,13 @@ if [[ "$APPLY_DROIDSPACES" == [sSeE] ]]; then
   echo "CONFIG_NTSYNC=y" >> "$DEFCONFIG_FILE"
   cd common
   # 应用 Droidspaces 容器必须补丁
-  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/fix_sysvipc_kabi_a16-6.12.patch
+  cp "$REPO_ROOT/droidspaces_patch/fix_sysvipc_kabi_a16-6.12.patch" ./fix_sysvipc_kabi_a16-6.12.patch
   patch -p1 -F 3 < fix_sysvipc_kabi_a16-6.12.patch || true
   # 修补 oplus_bsp_midas 行为，避免开机崩溃
-  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/fix_oplus_bsp_midas.patch
+  cp "$REPO_ROOT/droidspaces_patch/fix_oplus_bsp_midas.patch" ./fix_oplus_bsp_midas.patch
   patch -p1 -F 3 < fix_oplus_bsp_midas.patch || true
   # 应用 NTSync 补丁
-  wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/ntsync_compat_android16-6.12.patch
+  cp "$REPO_ROOT/droidspaces_patch/ntsync_compat_android16-6.12.patch" ./ntsync_compat_android16-6.12.patch
   patch -p1 -F 3 < ntsync_compat_android16-6.12.patch || true
   cd ..
   if [[ "$APPLY_DROIDSPACES" == [eE] ]]; then
@@ -354,7 +386,7 @@ if [[ "$APPLY_DROIDSPACES" == [sSeE] ]]; then
     # 添加 Lindroid EVDI DRM 驱动
     # echo "CONFIG_DRM_LINDROID_EVDI=y" >> "$DEFCONFIG_FILE"
     # cd common
-    # wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/droidspaces_patch/evdi_drm.patch
+    # EVDI remains disabled for this GKI build.
     # patch -p1 -F 3 < evdi_drm.patch || true
     # cd ..
   fi
@@ -363,6 +395,7 @@ fi
 # ===== 启用ADIOS调度器 =====
 if [[ "$APPLY_ADIOS" == "y" || "$APPLY_ADIOS" == "Y" ]]; then
   echo ">>> 正在启用ADIOS调度器..."
+  (cd common && patch -p1 --forward --fuzz=3 < "$REPO_ROOT/.github/patches/adios.patch")
   echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> "$DEFCONFIG_FILE"
   echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> "$DEFCONFIG_FILE"
 fi
@@ -370,6 +403,7 @@ fi
 # ===== 启用Re-Kernel =====
 if [[ "$APPLY_REKERNEL" == "y" || "$APPLY_REKERNEL" == "Y" ]]; then
   echo ">>> 正在启用Re-Kernel..."
+  (cd common && patch -p1 --forward --fuzz=3 < "$REPO_ROOT/.github/patches/rekernel.patch")
   echo "CONFIG_REKERNEL=y" >> "$DEFCONFIG_FILE"
   echo "CONFIG_REKERNEL_NETWORK=y" >> "$DEFCONFIG_FILE"
 fi
